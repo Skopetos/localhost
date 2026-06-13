@@ -12,6 +12,7 @@ struct Session {
     last_access: u64,
 }
 
+#[allow(dead_code)]
 impl SessionStore {
     pub fn new() -> Self {
         SessionStore {
