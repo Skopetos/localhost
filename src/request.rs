@@ -40,7 +40,6 @@ pub struct Request {
 
 #[derive(Debug)]
 pub enum ParseError {
-    Incomplete,
     Invalid(String),
     TooLarge,
 }
@@ -48,7 +47,6 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Incomplete => write!(f, "Incomplete request"),
             ParseError::Invalid(s) => write!(f, "Invalid request: {}", s),
             ParseError::TooLarge => write!(f, "Request entity too large"),
         }

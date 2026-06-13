@@ -1,6 +1,8 @@
 use crate::request::Request;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::io::FromRawFd;
+
+const CGI_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug)]
 pub enum CgiError {
@@ -96,16 +98,9 @@ pub fn run_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<Cgi
             libc::close(stdin_pipe[1]);
         }
 
-        // Read child stdout
-        let mut stdout_read = std::fs::File::from_raw_fd(stdout_pipe[0]);
-        let mut raw_output = Vec::new();
-        stdout_read
-            .read_to_end(&mut raw_output)
-            .map_err(|e| CgiError::Io(e.to_string()))?;
-
-        // Wait for child
-        let mut status = 0i32;
-        libc::waitpid(pid, &mut status, 0);
+        // Read child stdout with a timeout via select(2)
+        let read_fd = stdout_pipe[0];
+        let raw_output = read_with_timeout(pid, read_fd, CGI_TIMEOUT_SECS)?;
 
         parse_cgi_output(raw_output)
     }
@@ -144,6 +139,96 @@ unsafe fn set_env(key: &str, value: &str) {
     let k = std::ffi::CString::new(key).unwrap();
     let v = std::ffi::CString::new(value).unwrap();
     unsafe { libc::setenv(k.as_ptr(), v.as_ptr(), 1) };
+}
+
+fn read_with_timeout(pid: libc::pid_t, read_fd: libc::c_int, timeout_secs: u64) -> Result<Vec<u8>, CgiError> {
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0i32;
+                libc::waitpid(pid, &mut status, 0);
+                libc::close(read_fd);
+            }
+            return Err(CgiError::Timeout);
+        }
+
+        let mut tv = libc::timeval {
+            tv_sec: remaining.as_secs() as libc::time_t,
+            tv_usec: remaining.subsec_micros() as libc::suseconds_t,
+        };
+
+        // Build fd_set with read_fd
+        let mut rfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_ZERO(&mut rfds);
+            libc::FD_SET(read_fd, &mut rfds);
+        }
+
+        let ret = unsafe {
+            libc::select(
+                read_fd + 1,
+                &mut rfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+
+        if ret < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EINTR {
+                continue;
+            }
+            unsafe { libc::close(read_fd) };
+            return Err(CgiError::Io(format!("select() errno {}", err)));
+        }
+
+        if ret == 0 {
+            // Timeout expired during select
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0i32;
+                libc::waitpid(pid, &mut status, 0);
+                libc::close(read_fd);
+            }
+            return Err(CgiError::Timeout);
+        }
+
+        // Data available
+        let n = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+
+        if n < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EINTR {
+                continue;
+            }
+            unsafe { libc::close(read_fd) };
+            return Err(CgiError::Io(format!("read() errno {}", err)));
+        }
+
+        if n == 0 {
+            // EOF — child closed its stdout
+            break;
+        }
+
+        output.extend_from_slice(&buf[..n as usize]);
+    }
+
+    unsafe {
+        libc::close(read_fd);
+        let mut status = 0i32;
+        libc::waitpid(pid, &mut status, 0);
+    }
+
+    Ok(output)
 }
 
 fn parse_cgi_output(raw: Vec<u8>) -> Result<CgiResponse, CgiError> {

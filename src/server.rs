@@ -217,7 +217,6 @@ fn read_client(
                 send_error_and_close(fd, 400, el, clients);
                 return;
             }
-            Err(ParseError::Incomplete) => {}
         }
     }
 }
