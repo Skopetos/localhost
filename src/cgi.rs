@@ -120,28 +120,30 @@ unsafe fn setup_cgi_env(script_path: &str, req: &Request) {
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    set_env("REQUEST_METHOD", method);
-    set_env("PATH_INFO", script_path);
-    set_env("SCRIPT_FILENAME", script_path);
-    set_env("QUERY_STRING", &req.query_string);
-    set_env("CONTENT_LENGTH", &content_length);
-    set_env("CONTENT_TYPE", content_type);
-    set_env("SERVER_PROTOCOL", "HTTP/1.1");
-    set_env("GATEWAY_INTERFACE", "CGI/1.1");
-    set_env("SERVER_SOFTWARE", "localhost/1.0");
+    unsafe {
+        set_env("REQUEST_METHOD", method);
+        set_env("PATH_INFO", script_path);
+        set_env("SCRIPT_FILENAME", script_path);
+        set_env("QUERY_STRING", &req.query_string);
+        set_env("CONTENT_LENGTH", &content_length);
+        set_env("CONTENT_TYPE", content_type);
+        set_env("SERVER_PROTOCOL", "HTTP/1.1");
+        set_env("GATEWAY_INTERFACE", "CGI/1.1");
+        set_env("SERVER_SOFTWARE", "localhost/1.0");
 
-    if let Some(host) = req.headers.get("host") {
-        set_env("HTTP_HOST", host);
-    }
-    if let Some(cookie) = req.headers.get("cookie") {
-        set_env("HTTP_COOKIE", cookie);
+        if let Some(host) = req.headers.get("host") {
+            set_env("HTTP_HOST", host);
+        }
+        if let Some(cookie) = req.headers.get("cookie") {
+            set_env("HTTP_COOKIE", cookie);
+        }
     }
 }
 
 unsafe fn set_env(key: &str, value: &str) {
     let k = std::ffi::CString::new(key).unwrap();
     let v = std::ffi::CString::new(value).unwrap();
-    libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+    unsafe { libc::setenv(k.as_ptr(), v.as_ptr(), 1) };
 }
 
 fn parse_cgi_output(raw: Vec<u8>) -> Result<CgiResponse, CgiError> {
