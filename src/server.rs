@@ -503,6 +503,26 @@ fn write_client(fd: RawFd, el: &mut EventLoop, clients: &mut HashMap<RawFd, Clie
     }
 }
 
+fn finish_write(fd: RawFd, el: &mut EventLoop, clients: &mut HashMap<RawFd, Client>) {
+    let close = match clients.get_mut(&fd) {
+        Some(client) => {
+            client.write_buf.clear();
+            client.write_offset = 0;
+            client.close_after_write
+        }
+        None => return,
+    };
+
+    if close {
+        el.remove(fd);
+        clients.remove(&fd);
+    } else if let Err(e) = el.set_readable(fd) {
+        eprintln!("set_readable: {}", e);
+        el.remove(fd);
+        clients.remove(&fd);
+    }
+}
+
 fn send_error_and_close(
     fd: RawFd,
     code: u16,

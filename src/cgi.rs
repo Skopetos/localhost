@@ -5,6 +5,7 @@ use std::os::unix::io::RawFd;
 pub enum CgiError {
     ForkFailed,
     PipeFailed,
+    NotFound,
 }
 
 impl std::fmt::Display for CgiError {
@@ -12,6 +13,7 @@ impl std::fmt::Display for CgiError {
         match self {
             CgiError::ForkFailed => write!(f, "fork() failed"),
             CgiError::PipeFailed => write!(f, "pipe() failed"),
+            CgiError::NotFound => write!(f, "script not found"),
         }
     }
 }
@@ -34,6 +36,16 @@ pub struct CgiProcess {
 }
 
 pub fn spawn_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<CgiProcess, CgiError> {
+    // Resolve to an absolute path up front: the child chdir()s into the
+    // script's directory for CGI convenience, so a relative script_path
+    // would then be looked up relative to that *new* cwd and fail to open.
+    let script_path = std::fs::canonicalize(script_path)
+        .map_err(|_| CgiError::NotFound)?
+        .to_str()
+        .ok_or(CgiError::NotFound)?
+        .to_string();
+    let script_path = script_path.as_str();
+
     let mut stdin_pipe = [0i32; 2];
     let mut stdout_pipe = [0i32; 2];
 
