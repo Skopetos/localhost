@@ -523,6 +523,9 @@ fn finish_write(fd: RawFd, el: &mut EventLoop, clients: &mut HashMap<RawFd, Clie
     }
 }
 
+// Routes the response through the same epoll-driven write path as a normal
+// reply (finish_response/write_client) instead of writing the fd directly,
+// so every byte sent to a client passes through epoll, even on error paths.
 fn send_error_and_close(
     fd: RawFd,
     code: u16,
@@ -530,12 +533,7 @@ fn send_error_and_close(
     clients: &mut HashMap<RawFd, Client>,
 ) {
     let resp = Response::error(code, None);
-    let bytes = resp.serialize();
-    unsafe {
-        libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
-    }
-    el.remove(fd);
-    clients.remove(&fd);
+    finish_response(fd, resp, false, el, clients);
 }
 
 fn timeout_clients(el: &mut EventLoop, clients: &mut HashMap<RawFd, Client>) {
@@ -551,12 +549,7 @@ fn timeout_clients(el: &mut EventLoop, clients: &mut HashMap<RawFd, Client>) {
             crate::response::default_error_page(408).into_bytes(),
             "text/html; charset=utf-8",
         );
-        let bytes = resp.serialize();
-        unsafe {
-            libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
-        }
-        el.remove(fd);
-        clients.remove(&fd);
+        finish_response(fd, resp, false, el, clients);
     }
 }
 
