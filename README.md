@@ -127,7 +127,7 @@ Scripts are executed based on file extension configured in the location block. T
 ```
 REQUEST_METHOD, PATH_INFO, SCRIPT_FILENAME, QUERY_STRING,
 CONTENT_LENGTH, CONTENT_TYPE, SERVER_PROTOCOL, GATEWAY_INTERFACE,
-HTTP_HOST, HTTP_COOKIE
+SERVER_SOFTWARE, HTTP_HOST, HTTP_COOKIE
 ```
 
 Example Python CGI script (`www/cgi-bin/hello.py`):
@@ -168,5 +168,5 @@ Manual tests to verify:
 ## Limits
 
 - No TLS/HTTPS support
-- CGI scripts are blocking (forked process); very slow CGI will hold that response
+- CGI is non-blocking (the child's stdin/stdout pipes are driven through the same epoll loop), but a slow script still delays that one client's response until it finishes or hits the CGI timeout
 - Sessions are in-memory only and lost on restart
