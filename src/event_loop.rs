@@ -1,5 +1,5 @@
 use libc::{
-    epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLET, EPOLLIN, EPOLLOUT, EPOLL_CTL_ADD,
+    epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLLOUT, EPOLL_CTL_ADD,
     EPOLL_CTL_DEL, EPOLL_CTL_MOD,
 };
 use std::collections::HashMap;
@@ -8,11 +8,18 @@ use std::os::unix::io::RawFd;
 pub const MAX_EVENTS: usize = 256;
 pub const TIMEOUT_MS: i32 = 1000; // epoll_wait timeout in ms
 pub const CLIENT_TIMEOUT_SECS: u64 = 30;
+pub const CGI_TIMEOUT_SECS: u64 = 10;
 
+// Level-triggered on purpose: it lets the dispatch loop do exactly one
+// read()/write() per ready fd per epoll_wait() round and rely on epoll_wait()
+// to report the fd again next round if more data remains, instead of having
+// to drain in an inner loop (which edge-triggered mode would require).
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum FdKind {
     Listener(u16), // listening socket, associated port
     Client,
+    CgiStdout(RawFd), // associated client fd
+    CgiStdin(RawFd),  // associated client fd
 }
 
 pub struct EventLoop {
@@ -39,17 +46,35 @@ impl EventLoop {
     }
 
     pub fn add_client(&mut self, fd: RawFd) -> Result<(), String> {
-        self.add_fd(fd, (EPOLLIN | EPOLLET) as u32)?;
+        self.add_fd(fd, EPOLLIN as u32)?;
         self.fd_map.insert(fd, FdKind::Client);
         Ok(())
     }
 
     pub fn set_writable(&self, fd: RawFd) -> Result<(), String> {
-        self.mod_fd(fd, (EPOLLOUT | EPOLLET) as u32)
+        self.mod_fd(fd, EPOLLOUT as u32)
     }
 
     pub fn set_readable(&self, fd: RawFd) -> Result<(), String> {
-        self.mod_fd(fd, (EPOLLIN | EPOLLET) as u32)
+        self.mod_fd(fd, EPOLLIN as u32)
+    }
+
+    // Keep the fd registered (so HUP/ERR still surface) but stop reporting
+    // EPOLLIN while a CGI response is pending for this client.
+    pub fn set_idle(&self, fd: RawFd) -> Result<(), String> {
+        self.mod_fd(fd, 0)
+    }
+
+    pub fn add_cgi_stdout(&mut self, fd: RawFd, client_fd: RawFd) -> Result<(), String> {
+        self.add_fd(fd, EPOLLIN as u32)?;
+        self.fd_map.insert(fd, FdKind::CgiStdout(client_fd));
+        Ok(())
+    }
+
+    pub fn add_cgi_stdin(&mut self, fd: RawFd, client_fd: RawFd) -> Result<(), String> {
+        self.add_fd(fd, EPOLLOUT as u32)?;
+        self.fd_map.insert(fd, FdKind::CgiStdin(client_fd));
+        Ok(())
     }
 
     pub fn remove(&mut self, fd: RawFd) {

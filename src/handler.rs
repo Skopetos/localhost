@@ -7,29 +7,34 @@ use crate::session::{self, SessionStore};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub enum HandleOutcome {
+    Response(Response),
+    Cgi(crate::cgi::CgiProcess),
+}
+
 pub fn handle(
     req: &Request,
     servers: &[ServerConfig],
     port: u16,
     sessions: &mut SessionStore,
-) -> Response {
+) -> HandleOutcome {
     let host = req.headers.get("host").map(|s| s.as_str()).unwrap_or("");
     let server = router::match_server(servers, host, port);
 
     let route_match = match router::match_route(server, req) {
         Some(m) => m,
-        None => return serve_error(404, server, req),
+        None => return HandleOutcome::Response(serve_error(404, server, req)),
     };
 
     dispatch(req, route_match, sessions)
 }
 
-fn dispatch(req: &Request, m: RouteMatch, sessions: &mut SessionStore) -> Response {
+fn dispatch(req: &Request, m: RouteMatch, sessions: &mut SessionStore) -> HandleOutcome {
     let route = m.route;
 
     // Redirect
     if let Some((code, ref location)) = route.redirect {
-        return Response::redirect(code, location);
+        return HandleOutcome::Response(Response::redirect(code, location));
     }
 
     // Method check
@@ -39,19 +44,21 @@ fn dispatch(req: &Request, m: RouteMatch, sessions: &mut SessionStore) -> Respon
         .any(|meth| meth.eq_ignore_ascii_case(req.method.as_str()))
     {
         let allowed = route.allowed_methods.join(", ");
-        return Response::new(405)
-            .with_header("Allow", &allowed)
-            .with_body(
-                response::default_error_page(405).into_bytes(),
-                "text/html; charset=utf-8",
-            );
+        return HandleOutcome::Response(
+            Response::new(405)
+                .with_header("Allow", &allowed)
+                .with_body(
+                    response::default_error_page(405).into_bytes(),
+                    "text/html; charset=utf-8",
+                ),
+        );
     }
 
     // Resolve filesystem path
     let root = match &route.root {
         Some(r) => r.clone(),
         None => {
-            return Response::error(500, None);
+            return HandleOutcome::Response(Response::error(500, None));
         }
     };
 
@@ -66,7 +73,7 @@ fn dispatch(req: &Request, m: RouteMatch, sessions: &mut SessionStore) -> Respon
         }
     }
 
-    match req.method {
+    let resp = match req.method {
         Method::Get => handle_get(&fs_path, route, m.server, req, sessions),
         Method::Post => handle_post(&fs_path, route, m.server, req, sessions),
         Method::Delete => handle_delete(&fs_path, m.server, req),
@@ -74,7 +81,8 @@ fn dispatch(req: &Request, m: RouteMatch, sessions: &mut SessionStore) -> Respon
             response::default_error_page(501).into_bytes(),
             "text/html; charset=utf-8",
         ),
-    }
+    };
+    HandleOutcome::Response(resp)
 }
 
 fn handle_get(
@@ -171,38 +179,45 @@ fn handle_upload(req: &Request, upload_dir: &str, _server: &ServerConfig) -> Res
     Response::error(400, None)
 }
 
-fn run_cgi_handler(fs_path: &Path, req: &Request, ext: &str) -> Response {
+fn run_cgi_handler(fs_path: &Path, req: &Request, ext: &str) -> HandleOutcome {
     let script = match fs_path.to_str() {
         Some(s) => s.to_string(),
-        None => return Response::error(500, None),
+        None => return HandleOutcome::Response(Response::error(500, None)),
     };
 
     let binary = match ext.trim_start_matches('.') {
         "py" | "py3" => "/usr/bin/python3",
         "php" => "/usr/bin/php",
         "sh" => "/bin/sh",
-        _ => return Response::error(500, None),
+        _ => return HandleOutcome::Response(Response::error(500, None)),
     };
 
-    match cgi::run_cgi(&script, req, binary) {
-        Ok(cgi_resp) => {
-            let mut resp = Response::new(cgi_resp.status);
-            for (k, v) in &cgi_resp.headers {
-                resp = resp.with_header(k, v);
-            }
-            let ct = cgi_resp
-                .headers
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == "content-type")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("text/html");
-            resp.with_body(cgi_resp.body, ct)
-        }
+    if !Path::new(&script).exists() {
+        return HandleOutcome::Response(Response::error(404, None));
+    }
+
+    match cgi::spawn_cgi(&script, req, binary) {
+        Ok(proc) => HandleOutcome::Cgi(proc),
         Err(e) => {
             eprintln!("CGI error: {}", e);
-            Response::error(500, None)
+            HandleOutcome::Response(Response::error(500, None))
         }
     }
+}
+
+pub fn cgi_response_to_http(cgi_resp: cgi::CgiResponse) -> Response {
+    let mut resp = Response::new(cgi_resp.status);
+    for (k, v) in &cgi_resp.headers {
+        resp = resp.with_header(k, v);
+    }
+    let ct = cgi_resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.to_lowercase() == "content-type")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("text/html")
+        .to_string();
+    resp.with_body(cgi_resp.body, &ct)
 }
 
 fn serve_file(path: &Path, sessions: &mut SessionStore, req: &Request) -> Response {

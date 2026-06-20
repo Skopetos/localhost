@@ -1,15 +1,10 @@
 use crate::request::Request;
-use std::io::Write;
-use std::os::unix::io::FromRawFd;
-
-const CGI_TIMEOUT_SECS: u64 = 10;
+use std::os::unix::io::RawFd;
 
 #[derive(Debug)]
 pub enum CgiError {
     ForkFailed,
     PipeFailed,
-    Timeout,
-    Io(String),
 }
 
 impl std::fmt::Display for CgiError {
@@ -17,8 +12,6 @@ impl std::fmt::Display for CgiError {
         match self {
             CgiError::ForkFailed => write!(f, "fork() failed"),
             CgiError::PipeFailed => write!(f, "pipe() failed"),
-            CgiError::Timeout => write!(f, "CGI script timed out"),
-            CgiError::Io(s) => write!(f, "CGI I/O error: {}", s),
         }
     }
 }
@@ -29,8 +22,18 @@ pub struct CgiResponse {
     pub status: u16,
 }
 
-pub fn run_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<CgiResponse, CgiError> {
-    // Create pipes: parent reads from child stdout, parent writes to child stdin
+/// A CGI child process that has been spawned but not yet finished. Its stdin
+/// pipe (if there's a body to send) and stdout pipe are meant to be driven
+/// from the caller's epoll loop — no blocking I/O happens here.
+pub struct CgiProcess {
+    pub pid: libc::pid_t,
+    pub stdin_fd: Option<RawFd>,
+    pub stdin_data: Vec<u8>,
+    pub stdin_offset: usize,
+    pub stdout_fd: RawFd,
+}
+
+pub fn spawn_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<CgiProcess, CgiError> {
     let mut stdin_pipe = [0i32; 2];
     let mut stdout_pipe = [0i32; 2];
 
@@ -64,7 +67,6 @@ pub fn run_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<Cgi
 
             setup_cgi_env(script_path, req);
 
-            // Get the directory of the script for working directory
             let script_dir = std::path::Path::new(script_path)
                 .parent()
                 .and_then(|p| p.to_str())
@@ -87,22 +89,23 @@ pub fn run_cgi(script_path: &str, req: &Request, cgi_binary: &str) -> Result<Cgi
         libc::close(stdin_pipe[0]);
         libc::close(stdout_pipe[1]);
 
-        // Write request body to child stdin
-        if !req.body.is_empty() {
-            let mut stdin_write = std::fs::File::from_raw_fd(stdin_pipe[1]);
-            stdin_write
-                .write_all(&req.body)
-                .map_err(|e| CgiError::Io(e.to_string()))?;
-            // stdin_write drops here, closing the fd (signals EOF to CGI)
+        let _ = crate::event_loop::set_nonblocking(stdout_pipe[0]);
+
+        let stdin_fd = if !req.body.is_empty() {
+            let _ = crate::event_loop::set_nonblocking(stdin_pipe[1]);
+            Some(stdin_pipe[1])
         } else {
             libc::close(stdin_pipe[1]);
-        }
+            None
+        };
 
-        // Read child stdout with a timeout via select(2)
-        let read_fd = stdout_pipe[0];
-        let raw_output = read_with_timeout(pid, read_fd, CGI_TIMEOUT_SECS)?;
-
-        parse_cgi_output(raw_output)
+        Ok(CgiProcess {
+            pid,
+            stdin_fd,
+            stdin_data: req.body.clone(),
+            stdin_offset: 0,
+            stdout_fd: stdout_pipe[0],
+        })
     }
 }
 
@@ -141,135 +144,58 @@ unsafe fn set_env(key: &str, value: &str) {
     unsafe { libc::setenv(k.as_ptr(), v.as_ptr(), 1) };
 }
 
-fn read_with_timeout(pid: libc::pid_t, read_fd: libc::c_int, timeout_secs: u64) -> Result<Vec<u8>, CgiError> {
-    let mut output = Vec::new();
-    let mut buf = [0u8; 4096];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+/// Reap a finished/killed child without blocking. Safe to call repeatedly;
+/// returns true once the child has actually been reaped.
+pub fn try_reap(pid: libc::pid_t) -> bool {
+    let mut status = 0i32;
+    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    ret == pid
+}
 
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status = 0i32;
-                libc::waitpid(pid, &mut status, 0);
-                libc::close(read_fd);
-            }
-            return Err(CgiError::Timeout);
-        }
-
-        let mut tv = libc::timeval {
-            tv_sec: remaining.as_secs() as libc::time_t,
-            tv_usec: remaining.subsec_micros() as libc::suseconds_t,
-        };
-
-        // Build fd_set with read_fd
-        let mut rfds: libc::fd_set = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::FD_ZERO(&mut rfds);
-            libc::FD_SET(read_fd, &mut rfds);
-        }
-
-        let ret = unsafe {
-            libc::select(
-                read_fd + 1,
-                &mut rfds,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut tv,
-            )
-        };
-
-        if ret < 0 {
-            let err = unsafe { *libc::__errno_location() };
-            if err == libc::EINTR {
-                continue;
-            }
-            unsafe { libc::close(read_fd) };
-            return Err(CgiError::Io(format!("select() errno {}", err)));
-        }
-
-        if ret == 0 {
-            // Timeout expired during select
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status = 0i32;
-                libc::waitpid(pid, &mut status, 0);
-                libc::close(read_fd);
-            }
-            return Err(CgiError::Timeout);
-        }
-
-        // Data available
-        let n = unsafe {
-            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
-
-        if n < 0 {
-            let err = unsafe { *libc::__errno_location() };
-            if err == libc::EINTR {
-                continue;
-            }
-            unsafe { libc::close(read_fd) };
-            return Err(CgiError::Io(format!("read() errno {}", err)));
-        }
-
-        if n == 0 {
-            // EOF — child closed its stdout
-            break;
-        }
-
-        output.extend_from_slice(&buf[..n as usize]);
-    }
-
+pub fn kill_and_reap(pid: libc::pid_t) {
     unsafe {
-        libc::close(read_fd);
+        libc::kill(pid, libc::SIGKILL);
         let mut status = 0i32;
         libc::waitpid(pid, &mut status, 0);
     }
-
-    Ok(output)
 }
 
-fn parse_cgi_output(raw: Vec<u8>) -> Result<CgiResponse, CgiError> {
-    // CGI output: headers, blank line, then body
+pub fn parse_cgi_output(raw: Vec<u8>) -> CgiResponse {
     let separator = b"\r\n\r\n";
     let split_pos = raw
         .windows(4)
         .position(|w| w == separator)
-        .or_else(|| {
-            // Also accept \n\n
-            raw.windows(2).position(|w| w == b"\n\n")
-        });
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n"));
 
     let (header_bytes, body) = if let Some(pos) = split_pos {
         let sep_len = if raw[pos] == b'\r' { 4 } else { 2 };
         (&raw[..pos], raw[pos + sep_len..].to_vec())
     } else {
-        return Ok(CgiResponse {
+        return CgiResponse {
             headers: Vec::new(),
             body: raw,
             status: 200,
-        });
+        };
     };
 
-    let header_str = std::str::from_utf8(header_bytes).map_err(|_| CgiError::Io("Non-UTF8 headers".to_string()))?;
     let mut headers = Vec::new();
     let mut status = 200u16;
 
-    for line in header_str.lines() {
-        if let Some(colon) = line.find(':') {
-            let key = line[..colon].trim().to_string();
-            let value = line[colon + 1..].trim().to_string();
-            if key.to_lowercase() == "status" {
-                if let Ok(code) = value.splitn(2, ' ').next().unwrap_or("200").parse::<u16>() {
-                    status = code;
+    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
+        for line in header_str.lines() {
+            if let Some(colon) = line.find(':') {
+                let key = line[..colon].trim().to_string();
+                let value = line[colon + 1..].trim().to_string();
+                if key.to_lowercase() == "status" {
+                    if let Ok(code) = value.splitn(2, ' ').next().unwrap_or("200").parse::<u16>() {
+                        status = code;
+                    }
+                } else {
+                    headers.push((key, value));
                 }
-            } else {
-                headers.push((key, value));
             }
         }
     }
 
-    Ok(CgiResponse { headers, body, status })
+    CgiResponse { headers, body, status }
 }

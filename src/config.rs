@@ -49,7 +49,57 @@ fn parse_config_str(content: &str) -> Result<Config, String> {
         return Err("No server blocks found in config".to_string());
     }
 
+    validate_config(&servers)?;
+
     Ok(Config { servers })
+}
+
+/// Catches genuine port conflicts: the same host:port declared twice within
+/// one server block, or two server blocks claiming the same host:port with
+/// no way to distinguish between them (same server_name, or both wildcard/
+/// catch-all with no server_name at all). Different server_names sharing a
+/// host:port is normal virtual hosting and is left alone.
+fn validate_config(servers: &[ServerConfig]) -> Result<(), String> {
+    for server in servers {
+        let mut seen = std::collections::HashSet::new();
+        for &port in &server.ports {
+            if !seen.insert(port) {
+                return Err(format!(
+                    "Duplicate 'listen {}' in the same server block ({})",
+                    port, server.host
+                ));
+            }
+        }
+    }
+
+    for i in 0..servers.len() {
+        for j in (i + 1)..servers.len() {
+            let a = &servers[i];
+            let b = &servers[j];
+            if a.host != b.host {
+                continue;
+            }
+            for &port in &a.ports {
+                if !b.ports.contains(&port) {
+                    continue;
+                }
+                let conflict = if a.server_names.is_empty() && b.server_names.is_empty() {
+                    true
+                } else {
+                    a.server_names.iter().any(|n| b.server_names.contains(n))
+                };
+                if conflict {
+                    return Err(format!(
+                        "Conflicting configuration: {}:{} is claimed by more than one server block \
+                         with no distinguishing server_name",
+                        a.host, port
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_server_block<'a>(
